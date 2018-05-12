@@ -56,22 +56,20 @@ module ConsoleReaderActor =
     type Message = Message of string
 
     let create (writer : IActorRef<ConsoleWriterActor.Message>) =
-        let rec behaviour (Message message) =
-            let read = Console.ReadLine()
-            if String.IsNullOrEmpty read
-                && String.Equals(read, exitCommand, StringComparison.OrdinalIgnoreCase)
-            then
-                // shut down the system (acquire handle to system via
-                // this actors context)
-                Stop :> Effect<_>
-            else
-            // send input to the console writer to process and print
-            // YOU NEED TO FILL IN HERE
-
-            // continue reading messages from the console
-            // YOU NEED TO FILL IN HERE
-            become behaviour
-        actorOf behaviour
+        actorOf2 <| fun context ->
+            let rec behaviour (Message message) =
+                let read = Console.ReadLine()
+                if not (String.IsNullOrEmpty read)
+                    && String.Equals(read, exitCommand, StringComparison.OrdinalIgnoreCase)
+                then
+                    // shut down the system (acquire handle to system via
+                    // this actors context)
+                    Stop :> Effect<_>
+                else
+                    writer <! ConsoleWriterActor.Message message
+                    context.Self <! Message "continue"
+                    become behaviour
+            behaviour
         |> props
 
 let printInstructions () =
@@ -84,22 +82,22 @@ Some lines will appear as"""
     Console.WriteLine()
     Console.WriteLine "Type 'exit' to quit this application at any time.\n"
 
-let myActorSystem : Akka.Actor.ActorSystem = null
+let myActorSystem =
+    Configuration.defaultConfig()
+    |> System.create "MyActorSystem"
 
 [<EntryPoint>]
 let main argv =
-    // initialize MyActorSystem
-    // YOU NEED TO FILL IN HERE
-
     printInstructions()
 
-    // time to make your first actors!
-    //YOU NEED TO FILL IN HERE
-    // make consoleWriterActor using these props: Props.Create(() => new ConsoleWriterActor())
-    // make consoleReaderActor using these props: Props.Create(() => new ConsoleReaderActor(consoleWriterActor))
+    let writer =
+        ConsoleWriterActor.create ()
+        |> spawnAnonymous myActorSystem
+    let reader =
+        ConsoleReaderActor.create writer
+        |> spawnAnonymous myActorSystem
 
-    // tell console reader to begin
-    //YOU NEED TO FILL IN HERE
+    reader <! ConsoleReaderActor.Message "start"
 
     // blocks the main thread from exiting until the actor system is shut down
     myActorSystem.WhenTerminated.Wait()
