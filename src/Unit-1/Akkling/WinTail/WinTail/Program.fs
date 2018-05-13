@@ -3,6 +3,13 @@
 open Akkling
 open System
 
+[<AutoOpen>]
+module Utils =
+    let (|IsNullOrEmpty|_|) str =
+        if String.IsNullOrEmpty str
+        then Some ()
+        else None
+
 module Console =
     let private withColor fn color format =
         format
@@ -24,6 +31,52 @@ type ErrorType =
 type InputResult =
     | InputSuccess of Reason : string
     | InputError of Reason : string * Type : ErrorType
+
+let (|InputResult|_|) = tryUnbox<InputResult>
+
+type Command =
+    | Continue
+    | Exit
+    | Start
+    | Message of string
+
+/// <summary>
+/// Actor responsible for reading FROM the console.
+/// Also responsible for calling <see cref="ActorSystem.Terminate"/>.
+/// </summary>
+module ConsoleReaderActor =
+    type Message = Command
+
+    let [<Literal>] exitCommandLiteral = "exit"
+
+    let (|OrdinalIgnoreCaseEquals|_|) pattern str =
+        if String.Equals(str, pattern, StringComparison.OrdinalIgnoreCase)
+        then Some ()
+        else None
+
+    let (|ExitCommand|_|) = function
+        | OrdinalIgnoreCaseEquals exitCommandLiteral -> Some ()
+        | _ -> None
+
+    let printInstructions () =
+        [   "Write whatever you want into the console!"
+            "Some entries will pass validation, and some won't...\n\n"
+            "Type 'exit' to quit this application at any time.\n" ]
+        |> List.iter Console.WriteLine
+
+    let create (validator : IActorRef<string>) =
+        actorOf2 <| fun context ->
+            let rec behaviour (message : Message) =
+                match message with
+                    | Start -> printInstructions()
+                    | _ -> ()
+                match Console.ReadLine() with
+                | ExitCommand ->
+                    context.System.Terminate() |> ignore
+                | p -> validator <! p
+                become behaviour
+            behaviour
+        |> props
 
 /// <summary>
 /// Actor responsible for serializing message writes to the console.
@@ -49,60 +102,23 @@ module ConsoleWriterActor =
         actorOf behaviour
         |> props
 
-/// <summary>
-/// Actor responsible for reading FROM the console.
-/// Also responsible for calling <see cref="ActorSystem.Terminate"/>.
-/// </summary>
-module ConsoleReaderActor =
-    type Message =
-        | Start
-        | Continue
-        | InputResult of InputResult
-
-    let [<Literal>] exitCommandLiteral = "exit"
-
-    let (|IsNullOrEmpty|_|) str =
-        if String.IsNullOrEmpty str
-        then Some ()
-        else None
-
-    let (|OrdinalIgnoreCaseEquals|_|) pattern str =
-        if String.Equals(str, pattern, StringComparison.OrdinalIgnoreCase)
-        then Some ()
-        else None
-
-    let (|ExitCommand|_|) = function
-        | OrdinalIgnoreCaseEquals exitCommandLiteral -> Some ()
-        | _ -> None
-
-    let printInstructions () =
-        [   "Write whatever you want into the console!"
-            "Some entries will pass validation, and some won't...\n\n"
-            "Type 'exit' to quit this application at any time.\n" ]
-        |> List.iter Console.WriteLine
-
+module ValidationActor =
     let (|Valid|Invalid|) str =
         if (String.length str) % 2 = 0
         then Valid
         else Invalid
 
-    let create (writer : IActorRef<ConsoleWriterActor.Message>) =
+    let create writer =
         actorOf2 <| fun context ->
-            let rec behaviour (message : Message) =
+            let rec behaviour message =
                 match message with
-                    | Start -> printInstructions()
-                    | InputResult error -> writer <! error
-                    | _ -> ()
-                match Console.ReadLine() with
                 | IsNullOrEmpty ->
-                    context.Self <! InputResult (InputError ("Not imput received.", NullInput))
-                | ExitCommand ->
-                    context.System.Terminate() |> ignore
+                    writer <! InputError ("Not imput received.", NullInput)
                 | Valid ->
                     writer <! InputSuccess "Thank you! Message was valid."
-                    context.Self <! Continue
                 | Invalid ->
-                    context.Self <! InputResult (InputError ("Invalid: input had odd number of characters.", Validation))
+                    writer <! InputError ("Invalid: input had odd number of characters.", Validation)
+                context.Sender() <! Continue
                 become behaviour
             behaviour
         |> props
@@ -126,13 +142,16 @@ let main argv =
     printInstructions()
 
     let writer =
-        ConsoleWriterActor.create ()
-        |> spawnAnonymous myActorSystem
+        ConsoleWriterActor.create()
+        |> spawn myActorSystem "consoleWriterActor"
+    let validator =
+        ValidationActor.create writer
+        |> spawn myActorSystem "validationActor"
     let reader =
-        ConsoleReaderActor.create writer
-        |> spawnAnonymous myActorSystem
+        ConsoleReaderActor.create validator
+        |> spawn myActorSystem "consoleReaderActor"
 
-    reader <! ConsoleReaderActor.Start
+    reader <! Start
 
     // blocks the main thread from exiting until the actor system is shut down
     myActorSystem.WhenTerminated.Wait()
