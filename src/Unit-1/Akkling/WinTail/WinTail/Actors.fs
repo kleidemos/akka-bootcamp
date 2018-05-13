@@ -34,7 +34,7 @@ module ConsoleReaderActor =
                     | ExitCommand ->
                         context.System.Terminate() |> ignore
                     | p -> validator <! p
-                Ignore
+                ignored()
             behaviour
         |> props
 
@@ -46,7 +46,7 @@ module ConsoleWriterActor =
     type Message = InputResult
 
     let create () =
-        let rec behaviour (message : obj) =
+        let rec behaviour (message : obj) : obj Effect=
             match message with
             | InputResult (InputError (reason, _)) ->
                 reason
@@ -59,7 +59,7 @@ module ConsoleWriterActor =
                     ConsoleColor.Green
                     "%s"
             | p -> Console.printfnColor ConsoleColor.Yellow "%A" p
-            Ignore :> Effect<obj>
+            ignored()
         actorOf behaviour
         |> props
 
@@ -81,7 +81,7 @@ module ValidationActor =
                 | Invalid ->
                     writer <! InputError ("Invalid: input had odd number of characters.", Validation)
                 context.Sender() <! Continue
-                Ignore
+                ignored()
             behaviour
         |> props
 
@@ -101,7 +101,7 @@ module FileValidationActor =
                 | _ ->
                     writer <! InputError (sprintf "%s is not an existing URI on disk." message, ErrorType.Validation)
                     context.Sender() <! Continue
-                Ignore
+                ignored ()
             behaviour
         |> props
 
@@ -123,7 +123,7 @@ module TailActor =
             let text = fileStreamReader.ReadToEnd()
             do context.Self <! InitialRead(filePath, text)
 
-            let rec behaviour message =
+            let rec behaviour message : FileCommand Effect =
                 match message with
                 | FileWrite _ ->
                     let text = fileStreamReader.ReadToEnd()
@@ -133,7 +133,7 @@ module TailActor =
                     reporter <! sprintf "Tail error: %s" reason
                 | InitialRead (_, text) ->
                     reporter <! text
-                Ignore :> Effect<FileCommand>
+                ignored()
             become behaviour
 
 module TailCoordinatorActor =
@@ -145,7 +145,7 @@ module TailCoordinatorActor =
                     TailActor.create filePath reporter
                     |> spawn context "tailActor"
                     |> ignore
-                    Ignore :> Effect<_>
+                    ignored()
                 | _ ->
-                    upcast Ignore
+                    ignored()
             become behaviour
