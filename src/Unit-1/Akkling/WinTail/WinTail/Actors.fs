@@ -24,7 +24,7 @@ module ConsoleReaderActor =
     let printInstructions () =
         Console.WriteLine "Please provide the URI of a log file on disk.\n"
 
-    let create (validator : IActorRef<string>) =
+    let create () =
         actorOf2 <| fun context ->
             let rec behaviour (message : Message) =
                 match message with
@@ -33,7 +33,9 @@ module ConsoleReaderActor =
                 match Console.ReadLine() with
                     | ExitCommand ->
                         context.System.Terminate() |> ignore
-                    | p -> validator <! p
+                    | p ->
+                        select context.System
+                            "/user/fileValidatorActor" <! p
                 ignored()
             behaviour
         |> props
@@ -88,7 +90,7 @@ module ValidationActor =
 module FileValidationActor =
     let (|IsFileUrl|_|) path = Some path |> Option.filter System.IO.File.Exists
 
-    let create (writer : IActorRef<_>) tailCoordinator =
+    let create (writer : IActorRef<_>) =
         actorOf2 <| fun context ->
             let rec behaviour message =
                 match message with
@@ -97,7 +99,9 @@ module FileValidationActor =
                     context.Sender() <! Continue
                 | IsFileUrl _ ->
                     writer <! InputSuccess (sprintf "Starting processing for %s" message)
-                    tailCoordinator <! StartTail (message, retype writer)
+                    select context.System
+                        "/user/tailCoordinatorActor"
+                            <! StartTail (message, retype writer)
                 | _ ->
                     writer <! InputError (sprintf "%s is not an existing URI on disk." message, ErrorType.Validation)
                     context.Sender() <! Continue

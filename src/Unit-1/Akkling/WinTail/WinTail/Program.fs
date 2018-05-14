@@ -38,11 +38,11 @@ let main argv =
         }   |> spawn myActorSystem "tailCoordinatorActor"
 
     let fileValidator =
-        FileValidationActor.create (retype writer) tailCoordinator
+        FileValidationActor.create (retype writer)
         |> spawn myActorSystem "fileValidatorActor"
 
     let reader =
-        ConsoleReaderActor.create fileValidator
+        ConsoleReaderActor.create ()
         |> spawn myActorSystem "consoleReaderActor"
 
     reader <! Start
