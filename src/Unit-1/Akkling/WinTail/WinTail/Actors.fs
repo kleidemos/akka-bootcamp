@@ -114,7 +114,7 @@ module TailActor =
 
     let create filePath reporter =
         props <| fun context ->
-            let observer = new FileObserver(context.Self, System.IO.Path.GetFullPath filePath)
+            let observer = new FileObserver(retype context.Self, System.IO.Path.GetFullPath filePath)
             do observer.Start()
 
             let fileStream =
@@ -125,18 +125,25 @@ module TailActor =
                     FileShare.ReadWrite)
             let fileStreamReader = new StreamReader(fileStream, System.Text.Encoding.UTF8)
             let text = fileStreamReader.ReadToEnd()
-            do context.Self <! InitialRead(filePath, text)
+            do retype context.Self <! InitialRead(filePath, text)
 
-            let rec behaviour message : FileCommand Effect =
+            let rec behaviour (message : obj) : obj Effect =
                 match message with
-                | FileWrite _ ->
-                    let text = fileStreamReader.ReadToEnd()
-                    if not <| String.IsNullOrEmpty text then
+                | :? FileCommand as fcmd ->
+                    match fcmd with
+                    | FileWrite _ ->
+                        let text = fileStreamReader.ReadToEnd()
+                        if not <| String.IsNullOrEmpty text then
+                            reporter <! text
+                    | FileError (_, reason) ->
+                        reporter <! sprintf "Tail error: %s" reason
+                    | InitialRead (_, text) ->
                         reporter <! text
-                | FileError (_, reason) ->
-                    reporter <! sprintf "Tail error: %s" reason
-                | InitialRead (_, text) ->
-                    reporter <! text
+                | LifecycleEvent PostStop ->
+                    (observer :> IDisposable).Dispose()
+                    fileStream.Dispose()
+                    fileStream.Dispose()
+                | _ -> ()
                 ignored()
             become behaviour
 
