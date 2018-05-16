@@ -12,6 +12,7 @@ module Messages =
         | AddSeries of series : Series
         | RemoveSeries of seriesName : string
         | Metric of series : string * counterValue : float
+        | TogglePause
 
     let (|ChartMessage|_|) = tryUnbox<ChartMessage>
 
@@ -35,7 +36,7 @@ module Messages =
 
 /// Actors used to intialize chart data
 module ChartingActor =
-    let create (chart : Chart) =
+    let create (chart : Chart) (pauseButton : System.Windows.Forms.Button) =
         props <| fun context ->
             let maxPoints = 250
 
@@ -54,10 +55,16 @@ module ChartingActor =
                     area.AxisY.Minimum <- yValues |> List.fold min 0. |> System.Math.Floor
 
             let (|SeriesName|_|) = function
-                | InitializeChart _ -> None
+                | InitializeChart _ | TogglePause -> None
                 | AddSeries series -> Some series.Name
                 | RemoveSeries seriesName -> Some seriesName
                 | Metric (seriesName, _) -> Some seriesName
+
+            let setPauseButtonText paused =
+                pauseButton.Text <-
+                    if paused
+                    then "RESUME ->"
+                    else "PAUSE ||"
 
             let rec behaviour mapping numberOfPoints = function
                 | InitializeChart series ->
@@ -88,11 +95,29 @@ module ChartingActor =
                         series.Points.AddXY (numberOfPoints, counterValue) |> ignore
                         while (series.Points.Count > maxPoints) do series.Points.RemoveAt 0
                         setChartAndBecomeBehaviour mapping numberOfPoints
+                | TogglePause ->
+                    setPauseButtonText true
+                    paused mapping numberOfPoints |> become
                 | _ -> unhandled()
             and setChartAndBecomeBehaviour mapping numberOfPoints =
                 setChartBoundaries mapping numberOfPoints
                 behaviour mapping numberOfPoints |> become
-
+            and paused mapping numberOfPoints = function
+                | TogglePause ->
+                    setPauseButtonText false
+                    behaviour mapping numberOfPoints |> become
+                | SeriesName name when
+                    System.String.IsNullOrEmpty name ->
+                        unhandled()
+                | Metric (seriesName, _) when
+                    mapping.ContainsKey seriesName ->
+                        let numberOfPoints = numberOfPoints + 1
+                        let series = mapping.[seriesName]
+                        series.Points.AddXY (numberOfPoints, 0.) |> ignore
+                        while (series.Points.Count > maxPoints) do series.Points.RemoveAt 0
+                        setChartBoundaries mapping numberOfPoints
+                        paused mapping numberOfPoints |> become
+                | _ -> unhandled()
             behaviour Map.empty 0
             |> become
 
