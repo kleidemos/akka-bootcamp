@@ -6,7 +6,7 @@ open Akka.Util
 [<AutoOpen>]
 /// Helper class for creating random data for chart plots
 module ChartDataHelper =
-    let randomSeries (seriesName: string) (seriesType: SeriesChartType option) (points: int option) =
+    let randomSeries (seriesType: SeriesChartType option) (points: int option) (seriesName: string) =
         let seriesChartType = defaultArg seriesType SeriesChartType.Line
         let seriesPoints = defaultArg points 100
         let series = new Series(seriesName, ChartType = seriesChartType)
