@@ -105,7 +105,11 @@ module ChartingActor =
             and paused mapping numberOfPoints = function
                 | TogglePause ->
                     setPauseButtonText false
+                    context.UnstashAll()
                     behaviour mapping numberOfPoints |> become
+                | AddSeries _ | RemoveSeries _ ->
+                    context.Stash()
+                    ignored()
                 | SeriesName name when
                     System.String.IsNullOrEmpty name ->
                         unhandled()
