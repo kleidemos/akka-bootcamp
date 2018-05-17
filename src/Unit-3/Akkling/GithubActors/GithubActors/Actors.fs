@@ -115,29 +115,32 @@ module GithubValidatorActor =
         props <| fun context ->
             let behaviour = function
                 // outright invalid URLs
-                | ValidateRepo uri when uri |> String.IsNullOrEmpty || not (Uri.IsWellFormedUriString(uri, UriKind.Absolute)) ->
+                | ValidateRepo uri when
+                    String.IsNullOrEmpty uri
+                    || not <| Uri.IsWellFormedUriString(uri, UriKind.Absolute) ->
                     context.Sender() <! InvalidRepo (uri, "Not a valid absolute URI")
                     ignored()
-                // Repo that at least have a alid absolute URL
+                // repos that at least have a valid absolute URL
                 | ValidateRepo uri ->
                     let user, repo = splitIntoOwnerAndRepo uri
 
-                    function
+                    getGithubClient().Repository.Get(user, repo).ContinueWith (function
                         | TaskCancelled ->
                             InvalidRepo (uri, "Repo lookup timed out")
                         | TaskFaulted ->
                             InvalidRepo (uri, "Not a valid absolute URI")
                         | TaskSucceeded result ->
-                            ValidRepo result
-                    |> getGithubClient().Repository.Get(user, repo).ContinueWith
+                            ValidRepo result)
                     |> Async.AwaitTask
-                    |> pipeToWithSender context.Self (context.Sender() |> untyped) // send the message back to ourselves but pass the real sender through
+                    // send the message back to ourselves but pass the real sender through
+                    |> pipeToWithSender context.Self (context.Sender() |> untyped)
                     ignored()
                 | InvalidRepo _ as invRepo ->
                     context.Sender() <<! invRepo
                     ignored()
                 | ValidRepo repo ->
-                    select context "akka://GithubActors/user/commander" <! CanAcceptJob { Owner = repo.Owner.Login; Repo = repo.Name }
+                    select context "akka://GithubActors/user/commander"
+                        <! CanAcceptJob { Owner = repo.Owner.Login; Repo = repo.Name }
                     ignored()
                 | (UnableToAcceptJob _ as msg)
                 | (AbleToAcceptJob _ as msg) ->
@@ -161,7 +164,7 @@ module GithubWorkerActor =
                             |> Async.RunSynchronously
                         context.Sender() <! StarredReposForUser (login, starredRepos)
                     with
-                    | ex -> context.Sender() <! nextTry query // operation failed - let the parent know
+                    | _ -> context.Sender() <! nextTry query // operation failed - let the parent know
                     ignored()
                 | RetryableQuery ({ Query = GithubActorMessage (QueryStarrers repoKey) } as query) ->
                     try
@@ -173,7 +176,7 @@ module GithubWorkerActor =
 
                         context.Sender() <! UsersToQuery users
                     with
-                    | ex -> context.Sender() <! nextTry query // operation failed - let the parent know
+                    | _ -> context.Sender() <! nextTry query // operation failed - let the parent know
                     ignored()
                 | _ -> unhandled()
 
@@ -281,31 +284,54 @@ module GithubCoordinatorActor =
 module GithubCommanderActor =
     let create () =
         props <| fun (context : Actor<obj>) ->
-            let coordinator =
-                GithubCoordinatorActor.create()
-                |> spawn context "coordinator"
-                |> retype
+            let c1, c2, c3 =
+                List.init 3 (fun id ->
+                    GithubCoordinatorActor.create ()
+                    |> spawn context (sprintf "coordinator%i" (id+1))
+                    |> retype)
+                |> function
+                    | [a;b;c] -> a,b,c
+                    | _ -> failwith "WTF?!"
 
-            let rec behaviour canAcceptJobSender = function
+            let coordinatorPaths = [c1;c2;c3] |> List.map (fun p -> p.Path |> string)
+            let coordinator =
+                { Props<_>.From Props.Empty with
+                    Router = Some (upcast (Akka.Routing.BroadcastGroup coordinatorPaths)) }
+                |> spawnAnonymous context
+
+            let rec ready canAcceptJobSender pendingJobReplies = function
                 | GithubActorMessage (CanAcceptJob repoKey) ->
                     coordinator <! CanAcceptJob repoKey
-                    context.Sender() |> behaviour |> become
-                | GithubActorMessage (UnableToAcceptJob repoKey) ->
-                    canAcceptJobSender <! UnableToAcceptJob repoKey
+                    asking (context.Sender()) 3 |> become
+                | _ -> unhandled()
+            and asking canAcceptJobSender pendingJobReplies = function
+                | GithubActorMessage (CanAcceptJob _) ->
+                    context.Stash()
                     ignored()
+                | GithubActorMessage (UnableToAcceptJob repoKey) ->
+                    let currentPendingJobReplies = pendingJobReplies - 1
+                    if currentPendingJobReplies <= 0 then
+                        canAcceptJobSender <! UnableToAcceptJob repoKey
+                        context.UnstashAll()
+                        become (ready canAcceptJobSender currentPendingJobReplies)
+                    else
+                        become (asking canAcceptJobSender currentPendingJobReplies)
                 | GithubActorMessage (AbleToAcceptJob repoKey) ->
                     canAcceptJobSender <! AbleToAcceptJob repoKey
-                    coordinator <! BeginJob repoKey // start processing mesages
+                    // start processing mesages
+                    context.Sender() <! BeginJob repoKey
+                    // launch the new window to view results of the processing
                     select context "akka://GithubActors/user/mainform"
-                        <! LaunchRepoResultsWindow (repoKey, untyped coordinator) // launch the new window to view results of the processing
-                    ignored()
+                        <! LaunchRepoResultsWindow (repoKey, untyped <| context.Sender())
+                    context.UnstashAll()
+                    ready canAcceptJobSender pendingJobReplies |> become
                 | LifecycleEvent PostStop ->
                     retype coordinator <! PoisonPill.Instance
                     ignored()
                 | _ -> unhandled()
 
             // ОПАСНО!
-            behaviour (typed null) |> become
+            ready (typed null) 0 |> become
 
 module RepoResultsActor =
     let create (usersGrid : DataGridView) (statusLabel : ToolStripStatusLabel) (progressBar : ToolStripProgressBar) =

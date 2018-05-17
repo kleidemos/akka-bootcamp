@@ -13,4 +13,4 @@ module GithubClientFactory =
         GitHubClient (ProductHeaderValue "AkkaBootcamp-Unit3")
 
     let getClient () =
-         GitHubClient (ProductHeaderValue "AkkaBootcamp-Unit3", InMemoryCredentialStore (Credentials oauthToken))
+        GitHubClient (ProductHeaderValue "AkkaBootcamp-Unit3", InMemoryCredentialStore (Credentials oauthToken))
