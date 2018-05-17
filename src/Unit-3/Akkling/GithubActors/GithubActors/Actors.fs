@@ -12,34 +12,25 @@ module Actors =
     // make a pipe-friendly version of Akka.NET PipeTo for handling async computations
     let pipeToWithSender recipient sender asyncComp = pipeTo sender recipient asyncComp
 
-    // Helper functions to check the type of query received
-    let isWorkerMessage (someType: obj) = someType.GetType().IsSubclassOf(typeof<GithubActorMessage>)
-
-    let isQueryStarrers (someType: obj) =
-        if isWorkerMessage someType then
-            match someType :?> GithubActorMessage with
-            | QueryStarrers _ -> true
-            | _ -> false
-        else
-            false
-
-    let isQueryStarrer (someType: obj) =
-        if isWorkerMessage someType then
-            match someType :?> GithubActorMessage with
-            | QueryStarrer _ -> true
-            | _ -> false
-        else
-            false
+[<AutoOpen>]
+module private ActorUtils =
+    let (|TaskCancelled|TaskFaulted|TaskSucceeded|) (task : System.Threading.Tasks.Task<_>) =
+        match task.IsCanceled, task.IsFaulted with
+        | true, _ -> TaskCancelled
+        | false, true -> TaskFaulted
+        | false, false -> TaskSucceeded task.Result
 
 module GithubAuthenticationActor =
     let create (statusLabel : Label) (githubAuthForm : Form) (launcherForm : Form) =
         let cannotAuthenticate reason =
             statusLabel.ForeColor <- Color.Red
             statusLabel.Text <- reason
+
         let showAuthenticatingStatus () =
             statusLabel.Visible <- true
             statusLabel.ForeColor <- Color.Orange
             statusLabel.Text <- "Authenticating..."
+
         props <| fun context ->
             let rec unauthenticated = function
                 | Authenticate token ->
@@ -47,14 +38,13 @@ module GithubAuthenticationActor =
                     let client = GithubClientFactory.getUnauthenticatedClient()
                     client.Credentials <- Octokit.Credentials token
 
-                    fun (task : System.Threading.Tasks.Task<_>) ->
-                        match task.IsFaulted, task.IsCanceled with
-                        | true, _ -> AuthenticationFailed
-                        | false, true -> AuthenticationCancelled
-                        | false, false ->
+                    client.User.Current().ContinueWith (function
+                        | TaskCancelled -> AuthenticationFailed
+                        | TaskFaulted -> AuthenticationFailed
+                        | TaskSucceeded _ ->
                             GithubClientFactory.setOauthToken token
                             AuthenticationSuccess
-                    |> client.User.Current().ContinueWith
+                        )
                     |> Async.AwaitTask
                     |!> context.Self
 
@@ -117,12 +107,12 @@ module MainFormActor =
             become ready
 
 module GithubValidatorActor =
-    let create getGithubClient =
-        props <| fun context ->
-            let splitIntoOwnerAndRepo repoUri =
-                let results = Uri(repoUri, UriKind.Absolute).PathAndQuery.TrimEnd('/').Split('/') |> Array.rev
-                results.[1], results.[0] // User, Repo
+    let create (getGithubClient : _ -> Octokit.GitHubClient) =
+        let splitIntoOwnerAndRepo repoUri =
+            let results = Uri(repoUri, UriKind.Absolute).PathAndQuery.TrimEnd('/').Split('/') |> Array.rev
+            results.[1], results.[0] // User, Repo
 
+        props <| fun context ->
             let behaviour = function
                 // outright invalid URLs
                 | ValidateRepo uri when uri |> String.IsNullOrEmpty || not (Uri.IsWellFormedUriString(uri, UriKind.Absolute)) ->
@@ -130,17 +120,16 @@ module GithubValidatorActor =
                     ignored()
                 // Repo that at least have a alid absolute URL
                 | ValidateRepo uri ->
-                    let continuation (task : System.Threading.Tasks.Task<_>) =
-                        match task.IsCanceled, task.IsFaulted with
-                        | true, _ ->
-                            InvalidRepo (uri, "Repo lookup timed out")
-                        | false, true ->
-                            InvalidRepo (uri, "Not a valid absolute URI")
-                        | false, false ->
-                            ValidRepo task.Result
                     let user, repo = splitIntoOwnerAndRepo uri
-                    let githubClient : Octokit.GitHubClient = getGithubClient()
-                    githubClient.Repository.Get(user, repo).ContinueWith continuation
+
+                    function
+                        | TaskCancelled ->
+                            InvalidRepo (uri, "Repo lookup timed out")
+                        | TaskFaulted ->
+                            InvalidRepo (uri, "Not a valid absolute URI")
+                        | TaskSucceeded result ->
+                            ValidRepo result
+                    |> getGithubClient().Repository.Get(user, repo).ContinueWith
                     |> Async.AwaitTask
                     |> pipeToWithSender context.Self (context.Sender() |> untyped) // send the message back to ourselves but pass the real sender through
                     ignored()
@@ -148,7 +137,7 @@ module GithubValidatorActor =
                     context.Sender() <<! invRepo
                     ignored()
                 | ValidRepo repo ->
-                    select context "akka://GithubActors/user/commander" <! CanAcceptJob { Owner = repo.Owner.Location; Repo = repo.Name }
+                    select context "akka://GithubActors/user/commander" <! CanAcceptJob { Owner = repo.Owner.Login; Repo = repo.Name }
                     ignored()
                 | (UnableToAcceptJob _ as msg)
                 | (AbleToAcceptJob _ as msg) ->
@@ -192,16 +181,17 @@ module GithubWorkerActor =
 
 module GithubCoordinatorActor =
     let create () =
+        let startWorking repoKey (scheduler: IScheduler) =
+            {
+                ReceivedInitialUsers = false
+                CurrentRepo = repoKey
+                Subscribers = System.Collections.Generic.HashSet<IActorRef> ()
+                SimilarRepos = System.Collections.Generic.Dictionary<string, SimilarRepo> ()
+                GithubProgressStats = getDefaultStats ()
+                PublishTimer = new Cancelable (scheduler)
+            }
+
         props <| fun context ->
-            let startWorking repoKey (scheduler: IScheduler) =
-                {
-                    ReceivedInitialUsers = false
-                    CurrentRepo = repoKey
-                    Subscribers = System.Collections.Generic.HashSet<IActorRef> ()
-                    SimilarRepos = System.Collections.Generic.Dictionary<string, SimilarRepo> ()
-                    GithubProgressStats = getDefaultStats ()
-                    PublishTimer = new Cancelable (scheduler)
-                }
 
             // pre-start
             let githubWorker =
@@ -219,7 +209,7 @@ module GithubCoordinatorActor =
                 | _ -> ignored()
             and working (settings: WorkerSettings) = function
                 // received a downloaded user back from the github worker
-                | StarredReposForUser (login, repos) ->
+                | StarredReposForUser (_, repos) ->
                     repos
                     |> Seq.iter (fun repo ->
                         if not <| settings.SimilarRepos.ContainsKey repo.HtmlUrl then
@@ -275,14 +265,14 @@ module GithubCoordinatorActor =
                     githubWorker <! RetryableQuery query
                     ignored()
                 // query failed, can't be retried, and it's a QueryStarrers operation - meaning that the entire job failed
-                | RetryableQuery query when not query.CanRetry && isQueryStarrers query.Query ->
+                | RetryableQuery { Query = GithubActorMessage (QueryStarrers _) } ->
                     settings.Subscribers
                     |> Seq.iter (fun subscriber -> typed subscriber <! JobFailed settings.CurrentRepo)
 
                     settings.PublishTimer.Cancel ()
                     become waiting
                 // query failed, can't be retried, and it's a QueryStarrer operation - meaning that an individual operation failed
-                | RetryableQuery query when not query.CanRetry && isQueryStarrer query.Query ->
+                | RetryableQuery { Query = GithubActorMessage (QueryStarrer _) } ->
                     become <| working {settings with GithubProgressStats = incrementFailures settings.GithubProgressStats 1 }
                 | _ -> ignored()
 
@@ -290,7 +280,7 @@ module GithubCoordinatorActor =
 
 module GithubCommanderActor =
     let create () =
-        props <| fun context ->
+        props <| fun (context : Actor<obj>) ->
             let coordinator =
                 GithubCoordinatorActor.create()
                 |> spawn context "coordinator"
@@ -303,7 +293,7 @@ module GithubCommanderActor =
                 | GithubActorMessage (UnableToAcceptJob repoKey) ->
                     canAcceptJobSender <! UnableToAcceptJob repoKey
                     ignored()
-                | AbleToAcceptJob repoKey ->
+                | GithubActorMessage (AbleToAcceptJob repoKey) ->
                     canAcceptJobSender <! AbleToAcceptJob repoKey
                     coordinator <! BeginJob repoKey // start processing mesages
                     select context "akka://GithubActors/user/mainform"
@@ -319,39 +309,39 @@ module GithubCommanderActor =
 
 module RepoResultsActor =
     let create (usersGrid : DataGridView) (statusLabel : ToolStripStatusLabel) (progressBar : ToolStripProgressBar) =
-        props <| fun context ->
-            let startProgress stats =
-                progressBar.Minimum <- 0
-                progressBar.Step <- 1
-                progressBar.Maximum <- stats.ExpectedUsers
-                progressBar.Value <- stats.UsersThusFar
-                progressBar.Visible <- true
-                statusLabel.Visible <- true
+        let startProgress stats =
+            progressBar.Minimum <- 0
+            progressBar.Step <- 1
+            progressBar.Maximum <- stats.ExpectedUsers
+            progressBar.Value <- stats.UsersThusFar
+            progressBar.Visible <- true
+            statusLabel.Visible <- true
 
-            let displayProgress stats =
-                statusLabel.Text <- sprintf "%i out of %i users (%i failures) [%A elapsed]" stats.UsersThusFar stats.ExpectedUsers stats.QueryFailures stats.Elapsed
+        let displayProgress stats =
+            statusLabel.Text <- sprintf "%i out of %i users (%i failures) [%A elapsed]" stats.UsersThusFar stats.ExpectedUsers stats.QueryFailures stats.Elapsed
 
-            let stopProgress repo =
-                progressBar.Visible <- true
-                progressBar.ForeColor <- Color.Red
-                progressBar.Maximum <- 1
-                progressBar.Value <- 1
-                statusLabel.Visible <- true
-                statusLabel.Text <- sprintf "Failed to gather date for GitHub repository %s / %s" repo.Owner repo.Repo
+        let stopProgress repo =
+            progressBar.Visible <- true
+            progressBar.ForeColor <- Color.Red
+            progressBar.Maximum <- 1
+            progressBar.Value <- 1
+            statusLabel.Visible <- true
+            statusLabel.Text <- sprintf "Failed to gather date for GitHub repository %s / %s" repo.Owner repo.Repo
 
-            let displayRepo similarRepo =
-                let repo = similarRepo.Repo
-                let row = new DataGridViewRow()
-                row.CreateCells usersGrid
-                row.Cells.[0].Value <- repo.Owner.Login
-                row.Cells.[1].Value <- repo.Owner.Name
-                row.Cells.[2].Value <- repo.Owner.HtmlUrl
-                row.Cells.[3].Value <- similarRepo.SharedStarrers
-                row.Cells.[4].Value <- repo.OpenIssuesCount
-                row.Cells.[5].Value <- repo.StargazersCount
-                row.Cells.[6].Value <- repo.ForksCount
-                usersGrid.Rows.Add row |> ignore
+        let displayRepo similarRepo =
+            let repo = similarRepo.Repo
+            let row = new DataGridViewRow()
+            row.CreateCells usersGrid
+            row.Cells.[0].Value <- repo.Owner.Login
+            row.Cells.[1].Value <- repo.Owner.Name
+            row.Cells.[2].Value <- repo.Owner.HtmlUrl
+            row.Cells.[3].Value <- similarRepo.SharedStarrers
+            row.Cells.[4].Value <- repo.OpenIssuesCount
+            row.Cells.[5].Value <- repo.StargazersCount
+            row.Cells.[6].Value <- repo.ForksCount
+            usersGrid.Rows.Add row |> ignore
 
+        props <| fun _ ->
             let rec behaviour hasSetProgress = function
                 | GithubProgressStats stats -> // progress update
                     let hasSetProgress =
