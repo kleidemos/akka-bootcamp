@@ -107,3 +107,5 @@ module Messages =
         | UsersToQuery of users: Octokit.User array
         | GithubProgressStats of stats: GithubProgressStats
         | SimilarRepos of repos: SimilarRepo seq
+
+    let (|GithubActorMessage|_|) = tryUnbox<GithubActorMessage>

@@ -74,7 +74,7 @@ module RepoResultsForm =
 
         let actorName = generateRandomActorName ()
         let repoResultsActor =
-            { props (Actors.repoResultsActor dgUsers lblStatus progressBar) with
+            { RepoResultsActor.create dgUsers lblStatus progressBar with
                 Dispatcher = Some "akka.actor.synchronized-dispatcher" }
             |> spawn ActorSystem.githubActors actorName
         typed coordinator <! SubscribeToProgressUpdates (untyped repoResultsActor)

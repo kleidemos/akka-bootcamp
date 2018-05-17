@@ -31,8 +31,7 @@ module GithubAuthForm =
     let load () =
         let launcherForm = LauncherForm.load ()
         let authenticator =
-            Actors.githubAuthenticationActor lblAuthStatus form launcherForm
-            |> props
+            GithubAuthenticationActor.create lblAuthStatus form launcherForm
             |> spawn ActorSystem.githubActors "authenticator"
 
         lblLinkGitHub.LinkClicked.Add (fun _ -> Process.Start "https://help.github.com/articles/creating-an-access-token-for-command-line-use/" |> ignore)

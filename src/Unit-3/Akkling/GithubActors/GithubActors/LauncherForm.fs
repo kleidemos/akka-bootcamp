@@ -31,15 +31,13 @@ module LauncherForm =
             RepoResultsForm.createNew repoKey coordinator
 
         let mainFormActor =
-            Actors.mainFormActor lblIsValid createRepoResultsForm
-            |> props
+            MainFormActor.create lblIsValid createRepoResultsForm
             |> spawn ActorSystem.githubActors "mainform"
         let validator =
-            Actors.githubValidatorActor GithubClientFactory.getClient
-            |> props
+            GithubValidatorActor.create GithubClientFactory.getClient
             |> spawn ActorSystem.githubActors "validator"
         let commander =
-            props Actors.githubCommanderActor
+            GithubCommanderActor.create ()
             |> spawn ActorSystem.githubActors "commander"
 
         btnLaunch.Click.Add (fun _ -> mainFormActor <! ProcessRepo txtRepoUrl.Text)

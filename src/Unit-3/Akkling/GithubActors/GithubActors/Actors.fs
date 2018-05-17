@@ -31,231 +31,193 @@ module Actors =
         else
             false
 
-    // Actors
-    let githubAuthenticationActor (statusLabel: Label) (githubAuthForm: Form) (launcherForm: Form) (mailbox: Actor<_>) =
-
+module GithubAuthenticationActor =
+    let create (statusLabel : Label) (githubAuthForm : Form) (launcherForm : Form) =
         let cannotAuthenticate reason =
             statusLabel.ForeColor <- Color.Red
             statusLabel.Text <- reason
-
         let showAuthenticatingStatus () =
             statusLabel.Visible <- true
             statusLabel.ForeColor <- Color.Orange
             statusLabel.Text <- "Authenticating..."
-
-        let rec unauthenticated () =
-            actor {
-                let! message = mailbox.Receive ()
-
-                match message with
+        props <| fun context ->
+            let rec unauthenticated = function
                 | Authenticate token ->
                     showAuthenticatingStatus ()
-                    let client = GithubClientFactory.getUnauthenticatedClient ()
+                    let client = GithubClientFactory.getUnauthenticatedClient()
                     client.Credentials <- Octokit.Credentials token
 
-                    let continuation (task: System.Threading.Tasks.Task<Octokit.User>) : AuthenticationMessage =
-                        match task.IsFaulted with
-                        | true -> AuthenticationFailed
-                        | false ->
-                            match task.IsCanceled with
-                            | true -> AuthenticationCancelled
-                            | false ->
-                                GithubClientFactory.setOauthToken token
-                                AuthenticationSuccess
-
-                    client.User.Current().ContinueWith continuation
+                    fun (task : System.Threading.Tasks.Task<_>) ->
+                        match task.IsFaulted, task.IsCanceled with
+                        | true, _ -> AuthenticationFailed
+                        | false, true -> AuthenticationCancelled
+                        | false, false ->
+                            GithubClientFactory.setOauthToken token
+                            AuthenticationSuccess
+                    |> client.User.Current().ContinueWith
                     |> Async.AwaitTask
-                    |!> mailbox.Self
+                    |!> context.Self
 
-                    return! authenticating ()
-                | _ -> return! unauthenticated ()
-            }
-        and authenticating () =
-            actor {
-                let! message = mailbox.Receive ()
-
-                match message with
+                    become authenticating
+                | _ -> unhandled()
+            and authenticating = function
                 | AuthenticationFailed ->
                     cannotAuthenticate "Authentication failed."
-                    return! unauthenticated ()
+                    become unauthenticated
                 | AuthenticationCancelled ->
-                    cannotAuthenticate "Authentication timed out."
-                    return! unauthenticated ()
+                    cannotAuthenticate "Authenticatation timed out"
+                    become unauthenticated
                 | AuthenticationSuccess ->
                     githubAuthForm.Hide ()
-                    launcherForm.Show ()
-                | _ -> return! authenticating ()
-            }
+                    launcherForm.Show()
+                    ignored()
+                | _ -> unhandled()
+            become unauthenticated
 
-        unauthenticated ()
+module MainFormActor =
+    let create (isValidLabel : Label) createRepoResultsForm =
+        props <| fun context ->
+            let updateLabel isValid message =
+                isValidLabel.Text <- message
+                isValidLabel.ForeColor <- if isValid then Color.Green else Color.Red
+                context.UnstashAll()
 
-    let mainFormActor (isValidLabel: Label) (createRepoResultsForm) (mailbox: Actor<_>) =
-
-        let updateLabel message isValid =
-            isValidLabel.Text <- message
-            if isValid then isValidLabel.ForeColor <- Color.Green else isValidLabel.ForeColor <- Color.Red
-            mailbox.UnstashAll ()
-
-        let rec ready () =
-            actor {
-                let! message = mailbox.Receive ()
-
-                match message with
+            let rec ready = function
                 | ProcessRepo uri ->
-                    select  mailbox.System "akka://GithubActors/user/validator" <! ValidateRepo uri
+                    select context "akka://GithubActors/user/validator" <! ValidateRepo uri
                     isValidLabel.Visible <- true
                     isValidLabel.Text <- sprintf "Validating %s..." uri
                     isValidLabel.ForeColor <- Color.Orange
-                    return! busy ()
+                    become busy
                 | LaunchRepoResultsWindow (repoKey, coordinator) ->
-                    let repoResultsForm: Form = createRepoResultsForm repoKey coordinator
-                    repoResultsForm.Show ()
-                    return! ready ()
-                | _ -> return! ready ()
-            }
-        and busy () =
-            actor {
-                let! message = mailbox.Receive ()
-
-                match message with
+                    let repoResultsForm : Form = createRepoResultsForm repoKey coordinator
+                    repoResultsForm.Show()
+                    ignored()
+                | _ -> unhandled()
+            and busy = function
                 | ValidRepo _ ->
-                    updateLabel "Valid!" true
-                    return! ready ()
-                | InvalidRepo (uri, reason) ->
-                    updateLabel reason false
-                    return! ready ()
+                    updateLabel true "Valid!"
+                    become ready
+                | InvalidRepo (_, reason) ->
+                    updateLabel false reason
+                    become ready
                 | UnableToAcceptJob job ->
-                    updateLabel (sprintf "%s/%s is a valid repo, but the system cannot accept additional jobs" job.Owner job.Repo) false
-                    return! ready ()
+                    sprintf "%s/%s is a valid repo, but the system cannot accept additional jobs" job.Owner job.Repo
+                    |> updateLabel false
+                    become ready
                 | AbleToAcceptJob job ->
-                    updateLabel (sprintf "%s/%s is a valid repo - starting job!" job.Owner job.Repo) true
-                    return! ready ()
-                | LaunchRepoResultsWindow (_, _) ->
-                    mailbox.Stash ()
-                    return! busy ()
-                | _ -> return! busy ()
-            }
+                    sprintf "%s/%s is a valid repo - starting job" job.Owner job.Repo
+                    |> updateLabel true
+                    become ready
+                | LaunchRepoResultsWindow _ ->
+                    context.Stash()
+                    ignored()
+                | _ -> unhandled()
 
-        ready ()
+            become ready
 
-    let githubValidatorActor (getGithubClient: unit -> Octokit.GitHubClient) (mailbox: Actor<_>) =
+module GithubValidatorActor =
+    let create getGithubClient =
+        props <| fun context ->
+            let splitIntoOwnerAndRepo repoUri =
+                let results = Uri(repoUri, UriKind.Absolute).PathAndQuery.TrimEnd('/').Split('/') |> Array.rev
+                results.[1], results.[0] // User, Repo
 
-        let splitIntoOwnerAndRepo repoUri =
-            let results = Uri(repoUri, UriKind.Absolute).PathAndQuery.TrimEnd('/').Split('/') |> Array.rev
-            (results.[1], results.[0]) // User, Repo
+            let behaviour = function
+                // outright invalid URLs
+                | ValidateRepo uri when uri |> String.IsNullOrEmpty || not (Uri.IsWellFormedUriString(uri, UriKind.Absolute)) ->
+                    context.Sender() <! InvalidRepo (uri, "Not a valid absolute URI")
+                    ignored()
+                // Repo that at least have a alid absolute URL
+                | ValidateRepo uri ->
+                    let continuation (task : System.Threading.Tasks.Task<_>) =
+                        match task.IsCanceled, task.IsFaulted with
+                        | true, _ ->
+                            InvalidRepo (uri, "Repo lookup timed out")
+                        | false, true ->
+                            InvalidRepo (uri, "Not a valid absolute URI")
+                        | false, false ->
+                            ValidRepo task.Result
+                    let user, repo = splitIntoOwnerAndRepo uri
+                    let githubClient : Octokit.GitHubClient = getGithubClient()
+                    githubClient.Repository.Get(user, repo).ContinueWith continuation
+                    |> Async.AwaitTask
+                    |> pipeToWithSender context.Self (context.Sender() |> untyped) // send the message back to ourselves but pass the real sender through
+                    ignored()
+                | InvalidRepo _ as invRepo ->
+                    context.Sender() <<! invRepo
+                    ignored()
+                | ValidRepo repo ->
+                    select context "akka://GithubActors/user/commander" <! CanAcceptJob { Owner = repo.Owner.Location; Repo = repo.Name }
+                    ignored()
+                | (UnableToAcceptJob _ as msg)
+                | (AbleToAcceptJob _ as msg) ->
+                    select context "akka://GithubActors/user/mainform" <! msg
+                    ignored()
+                | _ -> unhandled()
 
-        let rec processMessage () = actor {
-            let! message = mailbox.Receive ()
+            behaviour |> become
 
-            match message with
-            // outright invalid URLs
-            | ValidateRepo uri when uri |> String.IsNullOrEmpty || not (Uri.IsWellFormedUriString(uri, UriKind.Absolute)) ->
-                mailbox.Sender() <! InvalidRepo(uri, "Not a valid absolute URI")
-            // repos that at least have a valid absolute URL
-            | ValidateRepo uri ->
-                let continuation (task: System.Threading.Tasks.Task<Octokit.Repository>) : GithubActorMessage =
-                    match task.IsCanceled with
-                    | true -> InvalidRepo(uri, "Repo lookup timed out")
-                    | false ->
-                        match task.IsFaulted with
-                        | true -> InvalidRepo(uri, "Not a valid absolute URI")
-                        | false -> ValidRepo task.Result
+module GithubWorkerActor =
+    let create () =
+        props <| fun context ->
+            let githubClient = lazy (GithubClientFactory.getClient ())
 
-                let (user, repo) = splitIntoOwnerAndRepo uri
-                let githubClient = getGithubClient ()
-                githubClient.Repository.Get(user, repo).ContinueWith continuation
-                |> Async.AwaitTask
-                |> pipeToWithSender mailbox.Self (mailbox.Sender() |> untyped) // send the message back to ourselves but pass the real sender through
-            | InvalidRepo (uri, reason) ->
-                InvalidRepo(uri, reason) |> mailbox.Sender().Forward
-            | ValidRepo repo ->
-                select mailbox "akka://GithubActors/user/commander" <! CanAcceptJob({ Owner = repo.Owner.Login; Repo = repo.Name })
-            | UnableToAcceptJob key ->
-                select mailbox "akka://GithubActors/user/mainform" <! UnableToAcceptJob key
-            | AbleToAcceptJob key ->
-                select mailbox "akka://GithubActors/user/mainform" <! AbleToAcceptJob key
-            | _ -> return! processMessage ()
-
-            return! processMessage ()
-        }
-
-        processMessage ()
-
-    // TODO implement
-    let githubWorkerActor (mailbox: Actor<_>) =
-
-        let githubClient = lazy (GithubClientFactory.getClient ())
-
-        let rec processMessage () = actor {
-            let! message = mailbox.Receive ()
-
-            match message with
-            | RetryableQuery query when isQueryStarrer query.Query || isQueryStarrers query.Query ->
-                match query.Query :?> GithubActorMessage with
-                | QueryStarrer login ->
+            let rec behaviour = function
+                | RetryableQuery ({ Query = GithubActorMessage (QueryStarrer login) } as query) ->
                     try
                         let starredRepos =
-                            githubClient.Value.Activity.Starring.GetAllForUser (login)
+                            githubClient.Value.Activity.Starring.GetAllForUser login
                             |> Async.AwaitTask
                             |> Async.RunSynchronously
-
-                        mailbox.Sender() <! StarredReposForUser(login, starredRepos)
+                        context.Sender() <! StarredReposForUser (login, starredRepos)
                     with
-                    | ex -> mailbox.Sender() <! nextTry query // operation failed - let the parent know
-                | QueryStarrers repoKey ->
+                    | ex -> context.Sender() <! nextTry query // operation failed - let the parent know
+                    ignored()
+                | RetryableQuery ({ Query = GithubActorMessage (QueryStarrers repoKey) } as query) ->
                     try
                         let users =
                             githubClient.Value.Activity.Starring.GetAllStargazers (repoKey.Owner, repoKey.Repo)
                             |> Async.AwaitTask
                             |> Async.RunSynchronously
-                            |> Seq.toArray
+                            |> Array.ofSeq
 
-                        mailbox.Sender() <! UsersToQuery users
+                        context.Sender() <! UsersToQuery users
                     with
-                    | ex -> mailbox.Sender() <! nextTry query // operation failed - let the parent know
-                | _ -> () // never reached
-            | _ -> ()
+                    | ex -> context.Sender() <! nextTry query // operation failed - let the parent know
+                    ignored()
+                | _ -> unhandled()
 
-            return! processMessage ()
-        }
+            behaviour |> become
 
-        processMessage ()
+module GithubCoordinatorActor =
+    let create () =
+        props <| fun context ->
+            let startWorking repoKey (scheduler: IScheduler) =
+                {
+                    ReceivedInitialUsers = false
+                    CurrentRepo = repoKey
+                    Subscribers = System.Collections.Generic.HashSet<IActorRef> ()
+                    SimilarRepos = System.Collections.Generic.Dictionary<string, SimilarRepo> ()
+                    GithubProgressStats = getDefaultStats ()
+                    PublishTimer = new Cancelable (scheduler)
+                }
 
-    let githubCoordinatorActor (mailbox: Actor<_>) =
+            // pre-start
+            let githubWorker =
+                GithubWorkerActor.create()
+                |> spawn context "worker"
 
-        let startWorking repoKey (scheduler: IScheduler) =
-            {
-                ReceivedInitialUsers = false
-                CurrentRepo = repoKey
-                Subscribers = System.Collections.Generic.HashSet<IActorRef> ()
-                SimilarRepos = System.Collections.Generic.Dictionary<string, SimilarRepo> ()
-                GithubProgressStats = getDefaultStats ()
-                PublishTimer = new Cancelable (scheduler)
-            }
-
-        // pre-start
-        let githubWorker = spawn mailbox "worker" (props githubWorkerActor)
-
-        let rec waiting () =
-            actor {
-                let! message = mailbox.Receive ()
-
-                match message with
+            let rec waiting = function
                 | CanAcceptJob repoKey ->
-                    mailbox.Sender() <! AbleToAcceptJob repoKey
+                    context.Sender() <! AbleToAcceptJob repoKey
+                    ignored()
                 | BeginJob repoKey ->
                     githubWorker <! RetryableQuery { Query = QueryStarrers repoKey; AllowableTries = 4; CurrentAttempt = 0 }
-                    let newSettings = startWorking repoKey mailbox.System.Scheduler
-                    return! working newSettings
-                | _ -> return! waiting ()
-
-                return! waiting ()
-            }
-        and working (settings: WorkerSettings) =
-            actor {
-                let! message = mailbox.Receive ()
-
-                match message with
+                    let newSettings = startWorking repoKey context.System.Scheduler
+                    working newSettings |> become
+                | _ -> ignored()
+            and working (settings: WorkerSettings) = function
                 // received a downloaded user back from the github worker
                 | StarredReposForUser (login, repos) ->
                     repos
@@ -265,8 +227,8 @@ module Actors =
                         else
                             settings.SimilarRepos.[repo.HtmlUrl] <- increaseSharedStarrers settings.SimilarRepos.[repo.HtmlUrl]
                     )
-
-                    return! working {settings with GithubProgressStats = userQueriesFinished settings.GithubProgressStats 1 }
+                    working {settings with GithubProgressStats = userQueriesFinished settings.GithubProgressStats 1 }
+                    |> become
                 | PublishUpdate ->
                     // Check to see if the job has fully completed
                     match settings.ReceivedInitialUsers && settings.GithubProgressStats.IsFinished with
@@ -286,131 +248,124 @@ module Actors =
                             typed subscriber <! GithubProgressStats finishStats)
 
                         settings.PublishTimer.Cancel ()
-                        return! waiting ()
+                        become waiting
                     | false ->
                         settings.Subscribers
                         |> Seq.iter (fun subscriber -> typed subscriber <! GithubProgressStats settings.GithubProgressStats)
+                        ignored()
                 | UsersToQuery users ->
                     // queue all the jobs
                     users |> Seq.iter (fun user -> githubWorker <! RetryableQuery { Query = QueryStarrer user.Login; AllowableTries = 3; CurrentAttempt = 0 })
-                    return! working {settings with GithubProgressStats = setExpectedUserCount settings.GithubProgressStats users.Length; ReceivedInitialUsers = true }
+                    become <| working {settings with GithubProgressStats = setExpectedUserCount settings.GithubProgressStats users.Length; ReceivedInitialUsers = true }
                 // the actor is currently busy, cannot handle the job now
                 | CanAcceptJob repoKey ->
-                    mailbox.Sender() <! UnableToAcceptJob repoKey
+                    context.Sender() <! UnableToAcceptJob repoKey
+                    ignored()
                 | SubscribeToProgressUpdates subscriber ->
                     // this is our first subscriber, which means we need to turn publishing on
                     if settings.Subscribers.Count = 0 then
-                        mailbox.System.Scheduler.ScheduleTellRepeatedly(
+                        context.System.Scheduler.ScheduleTellRepeatedly(
                             TimeSpan.FromMilliseconds 100., TimeSpan.FromMilliseconds 30.,
-                            untyped mailbox.Self, PublishUpdate, untyped mailbox.Self, settings.PublishTimer)
-                    settings.Subscribers.Add subscriber |> ignore
+                            untyped context.Self, PublishUpdate, untyped context.Self, settings.PublishTimer)
+                    settings.Subscribers.Add subscriber
+                    |> ignored
 
                 // query failed, but can be retried
                 | RetryableQuery query when query.CanRetry ->
                     githubWorker <! RetryableQuery query
+                    ignored()
                 // query failed, can't be retried, and it's a QueryStarrers operation - meaning that the entire job failed
                 | RetryableQuery query when not query.CanRetry && isQueryStarrers query.Query ->
                     settings.Subscribers
                     |> Seq.iter (fun subscriber -> typed subscriber <! JobFailed settings.CurrentRepo)
 
                     settings.PublishTimer.Cancel ()
-                    return! waiting ()
+                    become waiting
                 // query failed, can't be retried, and it's a QueryStarrer operation - meaning that an individual operation failed
                 | RetryableQuery query when not query.CanRetry && isQueryStarrer query.Query ->
-                    return! working {settings with GithubProgressStats = incrementFailures settings.GithubProgressStats 1 }
-                | _ -> return! working settings
+                    become <| working {settings with GithubProgressStats = incrementFailures settings.GithubProgressStats 1 }
+                | _ -> ignored()
 
-                return! working settings
-            }
+            become waiting
 
-        waiting ()
+module GithubCommanderActor =
+    let create () =
+        props <| fun context ->
+            let coordinator =
+                GithubCoordinatorActor.create()
+                |> spawn context "coordinator"
+                |> retype
 
-    let githubCommanderActor (mailbox: Actor<_>) =
-
-        // pre-start
-        let coordinator = spawn mailbox "coordinator" (props githubCoordinatorActor)
-
-        // post-stop, kill off the old coordinator so we can recreate it from scratch
-
-        // pass around the actor that sent the CanAcceptJob message
-        let rec processMessage canAcceptJobSender = actor {
-            let! (message : obj) = mailbox.Receive ()
-
-            match message with
-            | :? GithubActorMessage as gamsg ->
-                match gamsg with
-                | CanAcceptJob repoKey ->
+            let rec behaviour canAcceptJobSender = function
+                | GithubActorMessage (CanAcceptJob repoKey) ->
                     coordinator <! CanAcceptJob repoKey
-                    return! processMessage <| mailbox.Sender()
-                | UnableToAcceptJob repoKey ->
+                    context.Sender() |> behaviour |> become
+                | GithubActorMessage (UnableToAcceptJob repoKey) ->
                     canAcceptJobSender <! UnableToAcceptJob repoKey
+                    ignored()
                 | AbleToAcceptJob repoKey ->
                     canAcceptJobSender <! AbleToAcceptJob repoKey
-                    coordinator <! BeginJob repoKey // start processing messages
-                    select mailbox "akka://GithubActors/user/mainform"
-                        <! LaunchRepoResultsWindow(repoKey, untyped coordinator) // launch the new window to view results of the processing
-                | _ -> return! unhandled()
-            | LifecycleEvent PostStop ->
-                retype coordinator <! PoisonPill.Instance
-                return! ignored()
-            | _ -> return! processMessage canAcceptJobSender
+                    coordinator <! BeginJob repoKey // start processing mesages
+                    select context "akka://GithubActors/user/mainform"
+                        <! LaunchRepoResultsWindow (repoKey, untyped coordinator) // launch the new window to view results of the processing
+                    ignored()
+                | LifecycleEvent PostStop ->
+                    retype coordinator <! PoisonPill.Instance
+                    ignored()
+                | _ -> unhandled()
 
-            return! processMessage canAcceptJobSender
-        }
+            // ОПАСНО!
+            behaviour (typed null) |> become
 
-        processMessage (typed null)
+module RepoResultsActor =
+    let create (usersGrid : DataGridView) (statusLabel : ToolStripStatusLabel) (progressBar : ToolStripProgressBar) =
+        props <| fun context ->
+            let startProgress stats =
+                progressBar.Minimum <- 0
+                progressBar.Step <- 1
+                progressBar.Maximum <- stats.ExpectedUsers
+                progressBar.Value <- stats.UsersThusFar
+                progressBar.Visible <- true
+                statusLabel.Visible <- true
 
-    let repoResultsActor (usersGrid: DataGridView) (statusLabel: ToolStripStatusLabel) (progressBar: ToolStripProgressBar) (mailbox: Actor<_>) =
-        let startProgress stats =
-            progressBar.Minimum <- 0
-            progressBar.Step <- 1
-            progressBar.Maximum <- stats.ExpectedUsers
-            progressBar.Value <- stats.UsersThusFar
-            progressBar.Visible <- true
-            statusLabel.Visible <- true
+            let displayProgress stats =
+                statusLabel.Text <- sprintf "%i out of %i users (%i failures) [%A elapsed]" stats.UsersThusFar stats.ExpectedUsers stats.QueryFailures stats.Elapsed
 
-        let displayProgress stats =
-            statusLabel.Text <- sprintf "%i out of %i users (%i failures) [%A elapsed]" stats.UsersThusFar stats.ExpectedUsers stats.QueryFailures stats.Elapsed
+            let stopProgress repo =
+                progressBar.Visible <- true
+                progressBar.ForeColor <- Color.Red
+                progressBar.Maximum <- 1
+                progressBar.Value <- 1
+                statusLabel.Visible <- true
+                statusLabel.Text <- sprintf "Failed to gather date for GitHub repository %s / %s" repo.Owner repo.Repo
 
-        let stopProgress repo =
-            progressBar.Visible <- true
-            progressBar.ForeColor <- Color.Red
-            progressBar.Maximum <- 1
-            progressBar.Value <- 1
-            statusLabel.Visible <- true
-            statusLabel.Text <- sprintf "Failed to gather date for GitHub repository %s / %s" repo.Owner repo.Repo
+            let displayRepo similarRepo =
+                let repo = similarRepo.Repo
+                let row = new DataGridViewRow()
+                row.CreateCells usersGrid
+                row.Cells.[0].Value <- repo.Owner.Login
+                row.Cells.[1].Value <- repo.Owner.Name
+                row.Cells.[2].Value <- repo.Owner.HtmlUrl
+                row.Cells.[3].Value <- similarRepo.SharedStarrers
+                row.Cells.[4].Value <- repo.OpenIssuesCount
+                row.Cells.[5].Value <- repo.StargazersCount
+                row.Cells.[6].Value <- repo.ForksCount
+                usersGrid.Rows.Add row |> ignore
 
-        let displayRepo similarRepo =
-            let repo = similarRepo.Repo
-            let row = new DataGridViewRow()
-            row.CreateCells usersGrid
-            row.Cells.[0].Value <- repo.Owner.Login
-            row.Cells.[1].Value <- repo.Owner.Name
-            row.Cells.[2].Value <- repo.Owner.HtmlUrl
-            row.Cells.[3].Value <- similarRepo.SharedStarrers
-            row.Cells.[4].Value <- repo.OpenIssuesCount
-            row.Cells.[5].Value <- repo.StargazersCount
-            row.Cells.[6].Value <- repo.ForksCount
-            usersGrid.Rows.Add row |> ignore
+            let rec behaviour hasSetProgress = function
+                | GithubProgressStats stats -> // progress update
+                    let hasSetProgress =
+                        not hasSetProgress && stats.ExpectedUsers > 0
+                    if hasSetProgress then startProgress stats
+                    displayProgress stats
+                    progressBar.Value <- stats.UsersThusFar + stats.QueryFailures
+                    behaviour hasSetProgress |> become
+                | SimilarRepos repos -> // user update
+                    repos |> Seq.iter displayRepo
+                    ignored()
+                | JobFailed repoKey -> // critical failure, like not being able to connect to Github
+                    stopProgress repoKey
+                    ignored()
+                | _ -> unhandled()
 
-        let mutable hasSetProgress = false
-        let rec processMessage () = actor {
-            let! message = mailbox.Receive ()
-
-            match message with
-            | GithubProgressStats stats -> // progress update
-                if not hasSetProgress && stats.ExpectedUsers > 0 then
-                    startProgress stats
-                    hasSetProgress <- true
-                displayProgress stats
-                progressBar.Value <- stats.UsersThusFar + stats.QueryFailures
-            | SimilarRepos repos -> // user update
-                repos |> Seq.iter displayRepo
-            | JobFailed repoKey -> // critical failure, like not being able to connect to Github
-                stopProgress repoKey
-            | _ -> ()
-
-            return! processMessage ()
-        }
-
-        processMessage ()
+            behaviour false |> become
