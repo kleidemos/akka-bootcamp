@@ -5,3 +5,5 @@ framework: net461
 nuget Akkling
 nuget Microsoft.FSharpLu.Json
 nuget System.Collections.Immutable
+
+nuget Octokit
