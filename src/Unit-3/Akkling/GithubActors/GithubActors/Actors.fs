@@ -286,27 +286,22 @@ module GithubCoordinatorActor =
             become waiting
 
 module GithubCommanderActor =
+    open Akka.Routing
+
     let create () =
         props <| fun (context : Actor<obj>) ->
-            let coordinators =
-                List.init 3 (fun id ->
-                    GithubCoordinatorActor.create ()
-                    |> spawn context (sprintf "coordinator%i" (id+1)))
             let coordinator =
-                { Props<_>.From Props.Empty with
-                    Router =
-                        coordinators
-                        |> List.map (fun p -> p.Path |> string)
-                        |> Akka.Routing.BroadcastGroup
-                        :> Akka.Routing.RouterConfig
-                        |> Some }
-                |> spawnAnonymous context
+                { GithubCoordinatorActor.create () with
+                    Router = Some (FromConfig.Instance :> RouterConfig) }
+                |> spawn context "coordinator"
 
             // Зачем их передавать, если они все равно будут перезаписаны?
             let rec ready canAcceptJobSender pendingJobReplies = function
                 | GithubActorMessage (CanAcceptJob repoKey) ->
                     coordinator <! CanAcceptJob repoKey
-                    asking (context.Sender()) 3 |> become
+                    // Ask how many coordinator instances were created (i.e. how many pending job replies are expected)
+                    let routees : Routees = retype coordinator <? GetRoutees() |> Async.RunSynchronously
+                    asking (context.Sender()) (routees.Members |> Seq.length) |> become
                 | msg -> checkDefer msg
             and asking canAcceptJobSender pendingJobReplies = function
                 | GithubActorMessage (CanAcceptJob _) ->
@@ -333,7 +328,6 @@ module GithubCommanderActor =
             and checkDefer = function
                 | LifecycleEvent PostStop ->
                     retype coordinator <! PoisonPill.Instance
-                    coordinators |> List.iter (fun p -> retype p <! PoisonPill.Instance)
                     ignored()
                 | _ -> unhandled()
 
