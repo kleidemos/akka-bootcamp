@@ -198,7 +198,11 @@ module GithubCoordinatorActor =
 
             // pre-start
             let githubWorker =
-                GithubWorkerActor.create()
+                { GithubWorkerActor.create() with
+                    Router =
+                        Akka.Routing.RoundRobinPool 10
+                        :> Akka.Routing.RouterConfig
+                        |> Some }
                 |> spawn context "worker"
 
             let rec waiting = function
