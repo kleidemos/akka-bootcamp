@@ -284,26 +284,26 @@ module GithubCoordinatorActor =
 module GithubCommanderActor =
     let create () =
         props <| fun (context : Actor<obj>) ->
-            let c1, c2, c3 =
+            let coordinators =
                 List.init 3 (fun id ->
                     GithubCoordinatorActor.create ()
-                    |> spawn context (sprintf "coordinator%i" (id+1))
-                    |> retype)
-                |> function
-                    | [a;b;c] -> a,b,c
-                    | _ -> failwith "WTF?!"
-
-            let coordinatorPaths = [c1;c2;c3] |> List.map (fun p -> p.Path |> string)
+                    |> spawn context (sprintf "coordinator%i" (id+1)))
             let coordinator =
                 { Props<_>.From Props.Empty with
-                    Router = Some (upcast (Akka.Routing.BroadcastGroup coordinatorPaths)) }
+                    Router =
+                        coordinators
+                        |> List.map (fun p -> p.Path |> string)
+                        |> Akka.Routing.BroadcastGroup
+                        :> Akka.Routing.RouterConfig
+                        |> Some }
                 |> spawnAnonymous context
 
+            // Зачем их передавать, если они все равно будут перезаписаны?
             let rec ready canAcceptJobSender pendingJobReplies = function
                 | GithubActorMessage (CanAcceptJob repoKey) ->
                     coordinator <! CanAcceptJob repoKey
                     asking (context.Sender()) 3 |> become
-                | _ -> unhandled()
+                | msg -> checkDefer msg
             and asking canAcceptJobSender pendingJobReplies = function
                 | GithubActorMessage (CanAcceptJob _) ->
                     context.Stash()
@@ -325,8 +325,11 @@ module GithubCommanderActor =
                         <! LaunchRepoResultsWindow (repoKey, untyped <| context.Sender())
                     context.UnstashAll()
                     ready canAcceptJobSender pendingJobReplies |> become
+                | msg -> checkDefer msg
+            and checkDefer = function
                 | LifecycleEvent PostStop ->
                     retype coordinator <! PoisonPill.Instance
+                    coordinators |> List.iter (fun p -> retype p <! PoisonPill.Instance)
                     ignored()
                 | _ -> unhandled()
 
