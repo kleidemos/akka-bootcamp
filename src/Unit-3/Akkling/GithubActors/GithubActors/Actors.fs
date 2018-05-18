@@ -290,15 +290,31 @@ module GithubCommanderActor =
                     Router = Some (FromConfig.Instance :> RouterConfig) }
                 |> spawn context "coordinator"
 
+            let mutable currentRepoKey = { Owner = ""; Repo = "" }
+
             // Зачем их передавать, если они все равно будут перезаписаны?
             let rec ready canAcceptJobSender pendingJobReplies = function
                 | GithubActorMessage (CanAcceptJob repoKey) ->
                     coordinator <! CanAcceptJob repoKey
+                    currentRepoKey <- repoKey
                     // Ask how many coordinator instances were created (i.e. how many pending job replies are expected)
                     let routees : Routees = retype coordinator <? GetRoutees() |> Async.RunSynchronously
-                    asking (context.Sender()) (routees.Members |> Seq.length) |> become
+
+                    TimeSpan.FromSeconds 3.
+                        |> Some
+                        |> context.SetReceiveTimeout
+                    routees.Members
+                        |> Seq.length
+                        |> asking (context.Sender())
+                        |> become
                 | msg -> checkDefer msg
+            and (|ReceiveTimeout|_|) = tryUnbox<ReceiveTimeout>
             and asking canAcceptJobSender pendingJobReplies = function
+                | ReceiveTimeout timeout ->
+                    canAcceptJobSender <! UnableToAcceptJob currentRepoKey
+                    context.UnstashAll()
+                    context.SetReceiveTimeout None
+                    ready canAcceptJobSender pendingJobReplies |> become
                 | GithubActorMessage (CanAcceptJob _) ->
                     context.Stash()
                     ignored()
@@ -307,6 +323,7 @@ module GithubCommanderActor =
                     if currentPendingJobReplies <= 0 then
                         canAcceptJobSender <! UnableToAcceptJob repoKey
                         context.UnstashAll()
+                        context.SetReceiveTimeout None
                         become (ready canAcceptJobSender currentPendingJobReplies)
                     else
                         become (asking canAcceptJobSender currentPendingJobReplies)
@@ -318,6 +335,7 @@ module GithubCommanderActor =
                     select context "akka://GithubActors/user/mainform"
                         <! LaunchRepoResultsWindow (repoKey, untyped <| context.Sender())
                     context.UnstashAll()
+                    context.SetReceiveTimeout None
                     ready canAcceptJobSender pendingJobReplies |> become
                 | msg -> checkDefer msg
             and checkDefer = function
