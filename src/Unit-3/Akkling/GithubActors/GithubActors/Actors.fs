@@ -157,26 +157,21 @@ module GithubWorkerActor =
 
             let rec behaviour = function
                 | RetryableQuery ({ Query = GithubActorMessage (QueryStarrer login) } as query) ->
-                    try
-                        let starredRepos =
-                            githubClient.Value.Activity.Starring.GetAllForUser login
-                            |> Async.AwaitTask
-                            |> Async.RunSynchronously
-                        context.Sender() <! StarredReposForUser (login, starredRepos)
-                    with
-                    | _ -> context.Sender() <! nextTry query // operation failed - let the parent know
+                    let sender_ = context.Sender()
+                    githubClient.Value.Activity.Starring.GetAllForUser(login).ContinueWith (function
+                        | TaskFaulted | TaskCancelled -> RetryableQuery (nextTry query)
+                        | TaskSucceeded result -> StarredReposForUser (login, result))
+                    |> Async.AwaitTask
+                    |!> sender_
                     ignored()
                 | RetryableQuery ({ Query = GithubActorMessage (QueryStarrers repoKey) } as query) ->
-                    try
-                        let users =
-                            githubClient.Value.Activity.Starring.GetAllStargazers (repoKey.Owner, repoKey.Repo)
-                            |> Async.AwaitTask
-                            |> Async.RunSynchronously
-                            |> Array.ofSeq
-
-                        context.Sender() <! UsersToQuery users
-                    with
-                    | _ -> context.Sender() <! nextTry query // operation failed - let the parent know
+                    let sender_ = context.Sender()
+                    githubClient.Value.Activity.Starring
+                        .GetAllStargazers(repoKey.Owner, repoKey.Repo).ContinueWith (function
+                            | TaskFaulted | TaskCancelled -> RetryableQuery (nextTry query)
+                            | TaskSucceeded result -> result |> Array.ofSeq |> UsersToQuery)
+                    |> Async.AwaitTask
+                    |!> sender_
                     ignored()
                 | _ -> unhandled()
 
